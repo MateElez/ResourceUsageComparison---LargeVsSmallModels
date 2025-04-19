@@ -217,18 +217,55 @@ class DatabaseConnection:
             logger.error(f"Error deleting result: {e}")
             return False
 
-    def import_jsonl_to_tasks(self, jsonl_file_path: str) -> int:
+    def clear_tasks_collection(self) -> bool:
+        """
+        Remove all documents from the tasks collection
+        
+        Returns:
+            True if operation was successful, False otherwise
+        """
+        try:
+            result = self.tasks_collection.delete_many({})
+            deleted_count = result.deleted_count
+            logger.info(f"Cleared tasks collection, removed {deleted_count} documents")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing tasks collection: {e}")
+            return False
+
+    def clear_results_collection(self) -> bool:
+        """
+        Remove all documents from the results collection
+        
+        Returns:
+            True if operation was successful, False otherwise
+        """
+        try:
+            result = self.results_collection.delete_many({})
+            deleted_count = result.deleted_count
+            logger.info(f"Cleared results collection, removed {deleted_count} documents")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing results collection: {e}")
+            return False
+
+    def import_jsonl_to_tasks(self, jsonl_file_path: str, clear_first: bool = True) -> int:
         """
         Import data from a JSONL file into the tasks collection
         Each line in the JSONL file is parsed as a JSON object and inserted as a document
         
         Args:
             jsonl_file_path: Path to the JSONL file to import
+            clear_first: Whether to clear the collection before importing new data (default: True)
             
         Returns:
             Number of documents imported
         """
         import json
+        
+        # Clear the collection first if requested
+        if clear_first:
+            self.clear_tasks_collection()
         
         count = 0
         try:
@@ -250,18 +287,23 @@ class DatabaseConnection:
             logger.error(f"Error importing JSONL file: {e}")
             return count
 
-    def import_jsonl_to_results(self, jsonl_file_path: str) -> int:
+    def import_jsonl_to_results(self, jsonl_file_path: str, clear_first: bool = True) -> int:
         """
         Import data from a JSONL file into the results collection
         Each line in the JSONL file is parsed as a JSON object and inserted as a document
         
         Args:
             jsonl_file_path: Path to the JSONL file to import
+            clear_first: Whether to clear the collection before importing new data (default: True)
             
         Returns:
             Number of documents imported
         """
         import json
+        
+        # Clear the collection first if requested
+        if clear_first:
+            self.clear_results_collection()
         
         count = 0
         try:

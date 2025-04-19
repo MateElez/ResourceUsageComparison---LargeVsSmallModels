@@ -36,7 +36,7 @@ class ResourceComparisonWorkflow:
     def initialize_models(self, large_model_name: str = "deepseek-coder:7b", 
                          small_model_name: str = "tinyllama:1.1b",
                          ollama_url: str = "http://localhost:11434",
-                         max_branching_depth: int = 3):
+                         max_branching_depth: int = 4):
         """Initialize both models with specified settings"""
         logger.info(f"Initializing models: large={large_model_name}, small={small_model_name}")
         
@@ -86,14 +86,23 @@ class ResourceComparisonWorkflow:
             logger.error(f"Error saving result to database: {str(e)}")
             return None
             
-    def get_test_cases_for_task(self, task_type: str) -> List[Dict[str, Any]]:
+    def get_test_cases_for_task(self, task_type: str, task_data: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
-        Get predefined test cases for a specific task type
+        Get predefined test cases for a specific task type or from task data
         Args:
             task_type: Type of the task
+            task_data: Optional task data containing test cases
         Returns:
             List of test cases
         """
+        # If we have task data with test_list, use those tests
+        if task_data and "test_list" in task_data:
+            test_cases = []
+            # Format test cases from the test_list
+            for test in task_data["test_list"]:
+                test_cases.append({"test": test})
+            return test_cases
+            
         # For prime number check
         if task_type == "prime":
             return [
@@ -119,19 +128,20 @@ class ResourceComparisonWorkflow:
         # Add more task types as needed
         return []
     
-    def run_task(self, task_description: str, task_type: str = "") -> Dict[str, Any]:
+    def run_task(self, task_description: str, task_type: str = "", task_data: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Run a single task using both large and small models
         Args:
             task_description: Description of the task
             task_type: Type of the task, used for test cases
+            task_data: Optional task data containing test cases
         Returns:
             Comparison results
         """
         logger.info(f"Running task: {task_description[:50]}...")
         
         # Get test cases for the task
-        test_cases = self.get_test_cases_for_task(task_type)
+        test_cases = self.get_test_cases_for_task(task_type, task_data)
         
         # Execute with large model - TEMPORARILY DISABLED
         logger.info("Large model execution temporarily disabled to save time")
@@ -204,6 +214,14 @@ class ResourceComparisonWorkflow:
             }
         }
         
+        # Add the original task data if available
+        if task_data:
+            comparison["original_task"] = {
+                "task_id": task_data.get("task_id", ""),
+                "code": task_data.get("code", ""),
+                "test_list": task_data.get("test_list", [])
+            }
+        
         # Save to database
         self.save_result_to_db(comparison)
         
@@ -258,11 +276,12 @@ class ResourceComparisonWorkflow:
         results = []
         
         for task in tasks:
-            task_description = task.get("task_description", "")
+            # Za mbpp.jsonl zadatke, opis zadatka je u polju "text"
+            task_description = task.get("text", "") or task.get("task_description", "")
             task_type = task.get("task_type", "")
             
             if task_description:
-                result = self.run_task(task_description, task_type)
+                result = self.run_task(task_description, task_type, task)
                 results.append(result)
         
         return results
@@ -333,14 +352,32 @@ def main():
     parser.add_argument("--large-model", type=str, default="deepseek-r1:7b", help="Name of the large model")
     parser.add_argument("--small-model", type=str, default="qwen:0.5b", help="Name of the small model")
     parser.add_argument("--url", type=str, default="http://localhost:11434", help="Ollama API URL")
-    parser.add_argument("--max-depth", type=int, default=3, help="Maximum branching depth for adaptive small model")
+    parser.add_argument("--max-depth", type=int, default=6, help="Maximum branching depth for adaptive small model")
     parser.add_argument("--all", action="store_true", help="Run all tasks from database")
+    parser.add_argument("--import-data", action="store_true", help="Import tasks from JSONL file")
+    parser.add_argument("--jsonl-file", type=str, default="data/mbpp.jsonl", help="Path to JSONL file to import")
+    parser.add_argument("--no-clear", action="store_true", help="Do not clear the collection before importing data")
     
     args = parser.parse_args()
     
     # Initialize database connection
     db = DatabaseConnection()
     db.connect()
+    
+    # Import data if requested
+    if args.import_data:
+        if os.path.exists(args.jsonl_file):
+            clear_first = not args.no_clear
+            count = db.import_jsonl_to_tasks(args.jsonl_file, clear_first=clear_first)
+            print(f"Imported {count} tasks from {args.jsonl_file}")
+            if not args.all and not args.task:
+                db.disconnect()
+                return
+        else:
+            print(f"Error: JSONL file not found at {args.jsonl_file}")
+            if not args.all and not args.task:
+                db.disconnect()
+                return
     
     # Initialize workflow
     workflow = ResourceComparisonWorkflow(db)

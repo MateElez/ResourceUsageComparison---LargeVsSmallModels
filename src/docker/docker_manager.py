@@ -31,7 +31,7 @@ class DockerManager:
             CompletedProcess instance with command results
         """
         logger.debug(f"Running Docker command: {' '.join(command)}")
-        result = subprocess.run(command, capture_output=capture_output, text=True)
+        result = subprocess.run(command, capture_output=capture_output, text=True, encoding='utf-8')
         if result.returncode != 0:
             error_msg = f"Docker command failed: {result.stderr}"
             logger.error(error_msg)
@@ -79,7 +79,7 @@ class DockerManager:
         try:
             # Write code to temporary file
             code_file = 'temp_code.py'
-            with open(code_file, 'w') as f:
+            with open(code_file, 'w', encoding='utf-8') as f:
                 f.write(code)
             
             logger.info(f"Running code in Docker with limits: memory={memory_limit}, cpu={cpu_limit}")
@@ -196,8 +196,8 @@ class DockerManager:
                        code: str, 
                        memory_limit: str = "512m",
                        cpu_limit: float = 1.0,
-                       timeout: int = 30,
-                       monitoring_interval: float = 0.1) -> Dict:
+                       timeout: int = 60,  # Produženo na 60 sekundi za bolje praćenje resursa
+                       monitoring_interval: float = 0.05) -> Dict:  # Povećana učestalost uzorkovanja
         """
         Run code in a Docker container with continuous resource monitoring
         
@@ -226,7 +226,7 @@ class DockerManager:
         try:
             # Write code to temporary file
             code_file = 'temp_code.py'
-            with open(code_file, 'w') as f:
+            with open(code_file, 'w', encoding='utf-8') as f:
                 f.write(code)
             
             logger.info(f"Running code in Docker with limits: memory={memory_limit}, cpu={cpu_limit}")
@@ -251,26 +251,28 @@ def stress_cpu_and_memory():
     
     # First, wait for Docker stats to start collecting
     print("Waiting for Docker stats collection to initialize...", file=sys.stderr)
-    time.sleep(2.0)  # Give Docker stats time to start collecting
+    time.sleep(3.0)  # Dajemo Docker stats više vremena za početak prikupljanja
     
-    # Create significant memory pressure (about 250MB)
+    # Create significant memory pressure (about 500MB)
     print("Allocating memory blocks...", file=sys.stderr)
     memory_blocks = []
-    for i in range(50):  # 50 blocks x 5MB = ~250MB
+    for i in range(100):  # 100 blocks x 5MB = ~500MB
         # Each block is about 5MB of random data
         memory_blocks.append([random.random() for _ in range(625000)])
         if i % 10 == 0:
             print(f"Allocated {i*5}MB of memory", file=sys.stderr)
+            # Force a sync to ensure Docker stats captures this activity
+            os.fsync(sys.stderr.fileno())
         time.sleep(0.05)
     
     # Now perform CPU-intensive calculations to spike CPU usage
     print("Performing CPU intensive matrix calculations...", file=sys.stderr)
     start_time = time.time()
     
-    # Run for at least 10 seconds to ensure Docker catches it
-    while time.time() - start_time < 15.0:
+    # Run for at least 30 seconds to ensure Docker catches it
+    while time.time() - start_time < 30.0:
         # Create large matrices and multiply them
-        size = 200
+        size = 300  # Veće matrice = više CPU upotrebe
         matrix_a = [[random.random() for _ in range(size)] for _ in range(size)]
         matrix_b = [[random.random() for _ in range(size)] for _ in range(size)]
         
@@ -314,7 +316,7 @@ if memory_ref and memory_ref2:
 '''
             
             # Prepend imports and stress test to the original code
-            with open(code_file, 'w') as f:
+            with open(code_file, 'w', encoding='utf-8') as f:
                 f.write(stress_test_imports)
                 f.write(stress_test_code)
                 f.write(code)  # Original code in the middle
@@ -403,8 +405,8 @@ if memory_ref and memory_ref2:
                 monitoring_thread.join(timeout=1.0)
                 
             logger.info(f"Code execution completed in {execution_time:.2f} seconds")
-            logger.info(f"Resource usage - CPU: {metrics.get('max_cpu', 0):.2f}%, Memory: {metrics.get('max_memory', 0):.2f} MB")
-            logger.info(f"Collected {len(metrics.get('resource_data', []))} resource samples")
+            logger.info(f"Resource usage - CPU: {metrics.get("max_cpu", 0):.2f}%, Memory: {metrics.get("max_memory", 0):.2f} MB")
+            logger.info(f"Collected {len(metrics.get("resource_data", []))} resource samples")
             
             # Cleanup
             try:
@@ -658,14 +660,14 @@ if memory_ref and memory_ref2:
         logger.info(f"Resource monitoring complete for container {container_id}: collected {samples} samples")
         logger.info(f"Resource usage - CPU: max={metrics.get("max_cpu", 0):.2f}%, avg={metrics.get("avg_cpu", 0):.2f}%, Memory: max={metrics.get("max_memory", 0):.2f}MB, avg={metrics.get("avg_memory", 0):.2f}MB")
     
-    def _continuous_resource_monitoring_prestart(self, metrics: Dict, interval: float = 0.1, max_samples: int = 1000):
+    def _continuous_resource_monitoring_prestart(self, metrics: Dict, interval: float = 0.05, max_samples: int = 2000):
         """
         Thread function for continuously monitoring container resources, starting BEFORE the container
         is created. This is critical for catching the initial resource spike.
         
         Args:
             metrics: Shared dictionary for storing metrics
-            interval: Monitoring interval in seconds
+            interval: Monitoring interval in seconds (default: 0.05 - 20 samples/second)
             max_samples: Maximum number of samples to keep
         """
         samples = 0
@@ -684,7 +686,7 @@ if memory_ref and memory_ref2:
             if "container_id" in metrics:
                 container_id = metrics["container_id"]
                 logger.debug(f"Resource monitoring received container ID: {container_id}")
-            time.sleep(0.1)
+            time.sleep(0.05)  # Check more frequently
             
             # If we've waited too long (10 seconds) without getting a container ID, exit
             if time.time() - start_time > 10 and not container_id:
@@ -697,7 +699,12 @@ if memory_ref and memory_ref2:
             return
             
         # Now we have a container_id, start regular monitoring
-        while metrics["running"] and container_id:
+        container_running = True  # Assume container is running until proven otherwise
+        consecutive_errors = 0    # Track consecutive errors
+        min_monitoring_time = 30.0  # Force monitoring for at least 30 seconds
+        
+        while (metrics["running"] and container_id and 
+               (container_running or time.time() - start_time < min_monitoring_time)):
             try:
                 # Get container stats
                 stats_cmd = ['docker', 'stats', '--no-stream', '--format', '{{json .}}', container_id]
@@ -731,41 +738,53 @@ if memory_ref and memory_ref2:
                         })
                         
                         samples += 1
+                        consecutive_errors = 0  # Reset error counter on success
                         
                         # Calculate averages
                         if samples > 0:
                             metrics["avg_cpu"] = total_cpu / samples
                             metrics["avg_memory"] = total_memory / samples
                             
-                        logger.debug(f"Container {container_id} stats: CPU={cpu_usage:.2f}%, Memory={mem_usage:.2f}MB")
+                        # Log less frequently to avoid overwhelming logs
+                        if samples % 10 == 0:
+                            logger.debug(f"Container {container_id} stats: CPU={cpu_usage:.2f}%, Memory={mem_usage:.2f}MB")
                     except json.JSONDecodeError as e:
                         logger.error(f"Error parsing container stats JSON: {e}")
-                
-                # Make sure to continue monitoring for at least 5 seconds to capture resource spikes
-                if time.time() - start_time < 5.0:
-                    # Continue monitoring even if container might appear to be stopped
-                    # as stats might lag behind actual container state
-                    pass
+                        consecutive_errors += 1
                 else:
-                    # Check if container is still running, but only after initial monitoring period
-                    try:
-                        state = json.loads(self._run_command(
-                            ['docker', 'inspect', '--format', '{{json .State}}', container_id]
-                        ).stdout)
-                        
-                        if not state.get('Running', False):
-                            logger.debug(f"Container {container_id} stopped running")
-                            # Don't break here immediately - give it one more iteration to capture final stats
-                        
-                    except Exception as e:
-                        logger.error(f"Error checking container state: {e}")
-                        # Don't stop monitoring on a single error - the container might still be running
+                    consecutive_errors += 1
+                
+                # Check if we've been monitoring long enough to start checking container state
+                if time.time() - start_time >= min_monitoring_time * 0.1:  # After 10% of min time
+                    # Check if container is still running, but not too frequently
+                    if samples % 5 == 0:  # Every 5 samples
+                        try:
+                            state = json.loads(self._run_command(
+                                ['docker', 'inspect', '--format', '{{json .State}}', container_id]
+                            ).stdout)
+                            
+                            if not state.get('Running', False):
+                                logger.debug(f"Container {container_id} is no longer running")
+                                container_running = False
+                                # But we continue monitoring until min_monitoring_time is reached
+                            
+                        except Exception as e:
+                            logger.error(f"Error checking container state: {e}")
+                            consecutive_errors += 1
                     
+                # If we get too many consecutive errors, assume the container is gone
+                if consecutive_errors > 5:
+                    logger.warning(f"Too many consecutive errors ({consecutive_errors}), assuming container has stopped")
+                    container_running = False
+                
             except Exception as e:
                 logger.error(f"Error monitoring container resources: {e}")
+                consecutive_errors += 1
                 
-            # Sleep before next sample
+            # Sleep before next sample - shorter interval for better resolution
             time.sleep(interval)
         
-        logger.info(f"Resource monitoring complete for container {container_id}: collected {samples} samples")
-        logger.info(f"Resource usage - CPU: max={metrics.get('max_cpu', 0):.2f}%, avg={metrics.get('avg_cpu', 0):.2f}%, Memory: max={metrics.get('max_memory', 0):.2f}MB, avg={metrics.get('avg_memory', 0):.2f}MB")
+        # Log monitoring summary
+        monitoring_duration = time.time() - start_time
+        logger.info(f"Resource monitoring complete for container {container_id}: collected {samples} samples over {monitoring_duration:.2f} seconds")
+        logger.info(f"Resource usage - CPU: max={metrics.get("max_cpu", 0):.2f}%, avg={metrics.get("avg_cpu", 0):.2f}%, Memory: max={metrics.get("max_memory", 0):.2f}MB, avg={metrics.get("avg_memory", 0):.2f}MB")
