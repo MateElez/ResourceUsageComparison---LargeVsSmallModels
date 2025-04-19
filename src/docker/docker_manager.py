@@ -47,6 +47,16 @@ class DockerManager:
                 capture_output=False
             )
             logger.info(f"Docker image {self.base_image_name} built successfully")
+            
+    def is_docker_running(self):
+        """Check if Docker service is running"""
+        try:
+            self._run_command(['docker', 'version'])
+            logger.info("Docker service is running")
+            return True
+        except Exception as e:
+            logger.error(f"Docker service is not running: {e}")
+            return False
     
     def run_code(self, 
                 code: str, 
@@ -186,13 +196,53 @@ class DockerManager:
             Dictionary with resource usage metrics
         """
         try:
-            # Get overall Docker stats
-            stats = self._run_command(['docker', 'stats', '--no-stream', '--format', '{{json .}}']).stdout
-            stats_list = [json.loads(line) for line in stats.splitlines() if line.strip()]
+            # Check if Docker is running
+            if not self.is_docker_running():
+                logger.error("Cannot get resource usage - Docker service is not running")
+                return {
+                    "timestamp": time.time(),
+                    "container_count": 0,
+                    "total_cpu_percent": 0,
+                    "total_memory_mb": 0,
+                    "error": "Docker service is not running"
+                }
+                
+            # Try to get all running containers first
+            containers = self._run_command([
+                'docker', 'ps',
+                '--format', '{{.ID}}'
+            ]).stdout.splitlines()
+            
+            logger.info(f"Found {len(containers)} active Docker containers")
+            
+            if not containers:
+                return {
+                    "timestamp": time.time(),
+                    "container_count": 0,
+                    "total_cpu_percent": 0,
+                    "total_memory_mb": 0
+                }
+            
+            # Get stats for each container
+            stats_list = []
+            for container_id in containers:
+                try:
+                    stats_json = self._run_command(
+                        ['docker', 'stats', container_id, '--no-stream', '--format', '{{json .}}']
+                    ).stdout
+                    
+                    if stats_json.strip():  # Check if not empty
+                        container_stats = json.loads(stats_json)
+                        stats_list.append(container_stats)
+                        logger.debug(f"Container {container_id} stats: CPU={container_stats.get('CPUPerc', '0%')}, Memory={container_stats.get('MemUsage', '0B')}")
+                except Exception as e:
+                    logger.warning(f"Error getting stats for container {container_id}: {e}")
             
             # Calculate aggregate resource usage
             total_cpu = sum(float(s.get('CPUPerc', '0%').rstrip('%')) for s in stats_list)
             total_memory = sum(self._parse_memory_string(s.get('MemUsage', '0B / 0B').split(' / ')[0]) for s in stats_list)
+            
+            logger.info(f"Docker resource usage: Containers={len(stats_list)}, CPU={total_cpu}%, Memory={total_memory/(1024*1024):.2f}MB")
             
             return {
                 "timestamp": time.time(),
@@ -204,7 +254,10 @@ class DockerManager:
             logger.error(f"Error getting Docker resource usage: {str(e)}")
             return {
                 "timestamp": time.time(),
-                "error": str(e)
+                "error": str(e),
+                "container_count": 0,
+                "total_cpu_percent": 0,
+                "total_memory_mb": 0
             }
     
     def _parse_memory_string(self, memory_str: str) -> float:

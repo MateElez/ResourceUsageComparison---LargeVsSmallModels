@@ -45,8 +45,15 @@ class LargeModel(Model):
             docker_manager: Optional DockerManager instance for resource tracking
         """
         self.ollama = OllamaManager(model_name=model_name, base_url=base_url)
-        self.docker_manager = docker_manager
         self.model_name = model_name
+        
+        # Create a Docker manager for this model instance if not provided
+        if docker_manager is None:
+            self.docker_manager = DockerManager()
+            # Ensure the Docker image is built
+            self.docker_manager.build_base_image()
+        else:
+            self.docker_manager = docker_manager
         
         # Verify model is available or pull it
         if not self.ollama.verify_model_loaded():
@@ -68,21 +75,20 @@ class LargeModel(Model):
     
     def get_resource_usage(self) -> Dict[str, Any]:
         """Get resource usage metrics from Docker if available"""
-        if self.docker_manager:
-            # Assuming docker_manager has a get_resource_usage method
-            return self.docker_manager.get_resource_usage()
-        else:
-            # Basic metrics if docker manager isn't available
-            return {
-                "model": self.model_name,
-                "timestamp": datetime.now().isoformat(),
-                "cpu_usage": None,
-                "memory_usage": None
-            }
+        # Get resource usage from the Docker manager
+        docker_metrics = self.docker_manager.get_resource_usage()
+        
+        return {
+            "model": self.model_name,
+            "timestamp": datetime.now().isoformat(),
+            "cpu_usage": docker_metrics.get("total_cpu_percent"),
+            "memory_usage": docker_metrics.get("total_memory_mb"),
+            "container_count": docker_metrics.get("container_count", 1)
+        }
     
     def execute_task(self, task_description: str, test_cases: Optional[List[Dict]] = None) -> Dict[str, Any]:
         """
-        Execute a task using the large model
+        Execute a task using the large model in a Docker container
         Args:
             task_description: Description of the coding task
             test_cases: Optional list of test cases to validate the solution
@@ -90,29 +96,56 @@ class LargeModel(Model):
             Dictionary with solution, metrics and execution results
         """
         start_time = time.time()
+        container_id = None
         
-        # Generate code solution
-        solution = self.generate_solution(task_description)
-        
-        # Track resource usage
-        resource_metrics = self.get_resource_usage()
-        
-        # Calculate execution time
-        elapsed_time = time.time() - start_time
-        
-        result = {
-            "task": task_description,
-            "solution": solution,
-            "model": self.model_name,
-            "execution_time_seconds": elapsed_time,
-            "resource_metrics": resource_metrics,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # If test cases are provided, we could run the solution against them
-        # This would be implemented separately using the Docker sandbox
-        
-        return result
+        try:
+            # Generate code solution in its own Docker container
+            solution = self.generate_solution(task_description)
+            
+            # Track resource usage
+            resource_metrics = self.get_resource_usage()
+            
+            # Calculate execution time
+            elapsed_time = time.time() - start_time
+            
+            result = {
+                "task": task_description,
+                "solution": solution,
+                "model": self.model_name,
+                "execution_time_seconds": elapsed_time,
+                "resource_metrics": resource_metrics,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # If test cases are provided, evaluate the solution
+            if test_cases and solution:
+                evaluator = CodeEvaluator(timeout=30)
+                evaluation = evaluator.evaluate_solution(solution, test_cases)
+                result["evaluation"] = evaluation
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error executing task in Docker container: {str(e)}")
+            # Calculate execution time even if there was an error
+            elapsed_time = time.time() - start_time
+            
+            return {
+                "task": task_description,
+                "solution": None,
+                "model": self.model_name,
+                "execution_time_seconds": elapsed_time,
+                "error": str(e),
+                "resource_metrics": {"error": str(e)},
+                "timestamp": datetime.now().isoformat()
+            }
+        finally:
+            # Clean up resources
+            if container_id:
+                try:
+                    self.docker_manager.cleanup()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up container: {str(e)}")
 
 class AdaptiveSmallModel(Model):
     """
@@ -133,10 +166,17 @@ class AdaptiveSmallModel(Model):
             docker_manager: Optional DockerManager instance for resource tracking
         """
         self.ollama = OllamaManager(model_name=model_name, base_url=base_url)
-        self.docker_manager = docker_manager
         self.model_name = model_name
         self.max_branching_depth = max_branching_depth
         self.evaluator = CodeEvaluator(timeout=30)
+        
+        # Create a Docker manager for this model instance if not provided
+        if docker_manager is None:
+            self.docker_manager = DockerManager()
+            # Ensure the Docker image is built
+            self.docker_manager.build_base_image()
+        else:
+            self.docker_manager = docker_manager
         
         # Ensure the model is available
         if not self.ollama.verify_model_loaded():
@@ -161,6 +201,7 @@ class AdaptiveSmallModel(Model):
         depth = 0
         previous_attempts = []
         all_attempts = []
+        total_containers = 0
         
         while depth <= self.max_branching_depth:
             # Calculate number of instances for this depth (2^depth)
@@ -177,49 +218,90 @@ class AdaptiveSmallModel(Model):
             # Track depth start time for resource calculation
             depth_start_time = time.time()
             
+            # Create a Docker manager for each instance at this depth
+            instance_docker_managers = [DockerManager() for _ in range(num_instances)]
+            total_containers += num_instances
+            
             # Generate and evaluate solutions
             current_attempts = []
             for i, prompt in enumerate(prompts):
                 start_time = time.time()
                 logger.info(f"Generating solution for instance {i+1}/{num_instances} at depth {depth}")
                 
+                # Create a dedicated manager for this instance
+                instance_docker_manager = instance_docker_managers[i]
+                
+                # Create a dedicated ollama manager for this instance
+                instance_ollama = OllamaManager(model_name=self.model_name)
+                
                 # Slightly vary temperature for more diverse solutions
                 temperature = 0.2 + (i * 0.05)
-                solution = self.ollama.generate_code(prompt=prompt, temperature=temperature)
                 
-                # Evaluate the solution
-                evaluation = self.evaluator.evaluate_solution(solution, test_cases)
-                
-                # Calculate metrics
-                elapsed_time = time.time() - start_time
-                resource_metrics = self.get_resource_usage()
-                
-                attempt = {
-                    "depth": depth,
-                    "instance": i + 1,
-                    "solution": solution,
-                    "success": evaluation.get("success", False),
-                    "test_results": evaluation.get("test_results", []),
-                    "coverage": evaluation.get("test_coverage", "0/0"),
-                    "execution_time": elapsed_time,
-                    "prompt": prompt,
-                    "resource_metrics": resource_metrics
-                }
-                current_attempts.append(attempt)
-                all_attempts.append(attempt)
-                
-                # If we found a successful solution, return it immediately
-                if evaluation.get("success", False):
-                    logger.info(f"Found successful solution at depth {depth}, instance {i+1}")
+                try:
+                    # Generate solution in this instance's dedicated container
+                    logger.info(f"Creating Docker container for instance {i+1} at depth {depth}")
+                    solution = instance_ollama.generate_code(prompt=prompt, temperature=temperature)
                     
-                    return {
+                    # Evaluate the solution
+                    evaluation = self.evaluator.evaluate_solution(solution, test_cases)
+                    
+                    # Get resource usage from this instance's Docker container
+                    resource_metrics = instance_docker_manager.get_resource_usage()
+                    logger.info(f"Docker container for instance {i+1} at depth {depth} - resources: CPU={resource_metrics.get('total_cpu_percent', 0)}%, Memory={resource_metrics.get('total_memory_mb', 0):.2f}MB, Containers={resource_metrics.get('container_count', 0)}")
+                    
+                    # Calculate metrics
+                    elapsed_time = time.time() - start_time
+                    
+                    attempt = {
+                        "depth": depth,
+                        "instance": i + 1,
                         "solution": solution,
-                        "success": True,
+                        "success": evaluation.get("success", False),
+                        "test_results": evaluation.get("test_results", []),
                         "coverage": evaluation.get("test_coverage", "0/0"),
-                        "depth_reached": depth,
-                        "total_instances": len(all_attempts),
-                        "attempts": all_attempts
+                        "execution_time": elapsed_time,
+                        "prompt": prompt,
+                        "resource_metrics": resource_metrics,
+                        "container_id": f"instance_{depth}_{i+1}"  # Unique ID for this container
                     }
+                    current_attempts.append(attempt)
+                    all_attempts.append(attempt)
+                    
+                    # If we found a successful solution, clean up and return it immediately
+                    if evaluation.get("success", False):
+                        logger.info(f"Found successful solution at depth {depth}, instance {i+1}")
+                        
+                        # Clean up all Docker containers
+                        self._cleanup_docker_managers(instance_docker_managers)
+                        
+                        return {
+                            "solution": solution,
+                            "success": True,
+                            "coverage": evaluation.get("test_coverage", "0/0"),
+                            "depth_reached": depth,
+                            "total_instances": len(all_attempts),
+                            "total_containers": total_containers,
+                            "attempts": all_attempts,
+                            "resource_metrics": resource_metrics
+                        }
+                except Exception as e:
+                    logger.error(f"Error in instance {i+1} at depth {depth}: {str(e)}")
+                    # Add failed attempt with error information
+                    current_attempts.append({
+                        "depth": depth,
+                        "instance": i + 1,
+                        "solution": None,
+                        "success": False,
+                        "error": str(e),
+                        "execution_time": time.time() - start_time,
+                        "container_id": f"instance_{depth}_{i+1}"
+                    })
+                finally:
+                    # Clean up this instance's Docker container
+                    try:
+                        instance_docker_manager.cleanup()
+                    except Exception as cleanup_error:
+                        logger.warning(f"Error cleaning up Docker container for instance {i+1} at depth {depth}: {cleanup_error}")
             
             # Add this depth's attempts to previous attempts for next iteration
             previous_attempts = current_attempts
@@ -239,14 +321,28 @@ class AdaptiveSmallModel(Model):
         logger.warning(f"No fully successful solution found after {len(all_attempts)} attempts. "
                       f"Returning best attempt with coverage {best_attempt.get('coverage', '0/0')}")
         
+        # Get final aggregated resource metrics
+        final_resource_metrics = self.docker_manager.get_resource_usage()
+        
         return {
             "solution": best_attempt["solution"],
             "success": False,
             "coverage": best_attempt.get("coverage", "0/0"),
             "depth_reached": self.max_branching_depth,
             "total_instances": len(all_attempts),
-            "attempts": all_attempts
+            "total_containers": total_containers,
+            "attempts": all_attempts,
+            "resource_metrics": final_resource_metrics
         }
+    
+    def _cleanup_docker_managers(self, docker_managers: List[DockerManager]):
+        """Clean up multiple Docker managers"""
+        for i, manager in enumerate(docker_managers):
+            try:
+                manager.cleanup()
+                logger.debug(f"Cleaned up Docker manager {i+1}")
+            except Exception as e:
+                logger.warning(f"Error cleaning up Docker manager {i+1}: {str(e)}")
     
     def _calculate_coverage_score(self, coverage_str: str) -> float:
         """Calculate a score from coverage string (e.g. "3/5")"""
@@ -307,9 +403,9 @@ class AdaptiveSmallModel(Model):
                 {task_description}
                 
                 A previous attempt was:
-                ```python
+                '''python
                 {best_attempt['solution']}
-                ```
+                '''
                 
                 However, this solution failed on the following test cases:
                 {failure_info}
@@ -324,9 +420,9 @@ class AdaptiveSmallModel(Model):
                 {task_description}
                 
                 A previous attempt was:
-                ```python
+                '''python
                 {best_attempt['solution']}
-                ```
+                '''
                 
                 This solution had issues. Please provide a new solution that carefully handles edge cases.
                 Consider invalid inputs, extreme values, and special cases.
@@ -343,9 +439,9 @@ class AdaptiveSmallModel(Model):
                 {task_description}
                 
                 A previous attempt was:
-                ```python
+                '''python
                 {best_attempt['solution']}
-                ```
+                '''
                 
                 Please provide a more efficient solution, focusing on algorithmic improvements
                 while ensuring it still handles all test cases correctly.
@@ -362,9 +458,9 @@ class AdaptiveSmallModel(Model):
                 Previous attempts have failed. Please provide a completely new solution 
                 using a different approach than this implementation:
                 
-                ```python
+                '''python
                 {best_attempt['solution']}
-                ```
+                '''
                 
                 The solution needs to address these failed test cases:
                 {failure_info}
@@ -504,6 +600,7 @@ class AdaptiveSmallModel(Model):
             "attempts": generation_result["attempts"],
             "depth_reached": generation_result["depth_reached"],
             "total_instances": generation_result["total_instances"],
+            "total_containers": generation_result["total_containers"],
             "resource_metrics": resource_metrics,
             "timestamp": datetime.now().isoformat(),
             "evaluation": evaluation
