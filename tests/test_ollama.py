@@ -81,8 +81,8 @@ def test_large_model():
         }
         
         # Insert into database
-        task_id = db.insert_task(document)
-        logger.info(f"Results saved to database with ID: {task_id}")
+        result_id = db.insert_result(document)
+        logger.info(f"Results saved to database with ID: {result_id}")
         
         # Disconnect from database
         db.disconnect()
@@ -160,8 +160,8 @@ def test_small_model():
         }
         
         # Insert into database
-        task_id = db.insert_task(document)
-        logger.info(f"Results saved to database with ID: {task_id}")
+        result_id = db.insert_result(document)
+        logger.info(f"Results saved to database with ID: {result_id}")
         
         # Disconnect from database
         db.disconnect()

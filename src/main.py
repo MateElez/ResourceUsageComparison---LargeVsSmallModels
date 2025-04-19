@@ -72,16 +72,16 @@ class ResourceComparisonWorkflow:
     
     def save_result_to_db(self, result: Dict[str, Any]) -> Optional[str]:
         """
-        Save a result to the database
+        Save a result to the database in the results collection
         Args:
             result: Result document to save
         Returns:
             ID of the inserted document if successful, None otherwise
         """
         try:
-            task_id = self.db.insert_task(result)
-            logger.info(f"Saved result to database with ID: {task_id}")
-            return task_id
+            result_id = self.db.insert_result(result)
+            logger.info(f"Saved result to database with ID: {result_id}")
+            return result_id
         except Exception as e:
             logger.error(f"Error saving result to database: {str(e)}")
             return None
